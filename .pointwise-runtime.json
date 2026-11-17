@@ -2,6 +2,6 @@
   "version": 1,
   "kind": "cli",
   "setup": [],
-  "verify": ["python3.11", "-B", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
-  "demo": ["python3.11", "-B", "-m", "surface.results.checking", "--demo", "samples/normal.json"]
+  "verify": ["python3.11", "-B", "retriangulation_cases.py", "--verify"],
+  "demo": ["python3.11", "-B", "retriangulation_cases.py", "--demo"]
 }

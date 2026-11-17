@@ -1,9 +1,13 @@
 from dataclasses import dataclass
 from surface.sources.revisions import RevisionRepository, ConflictError
+from surface.sources.mesh_input import normalize_mesh
 from surface.mesh.barycentric import validate_sample
+from surface.mesh.model import OrdinaryMesh
+from surface.mesh.overlay import build_transfer_evidence
 from surface.results.codec import encode_payload, decode_payload, canonical_digest
 
 CONVENTION = "ordinary-surface-v1"
+RETRIANGULATION_CONVENTION = "retriangulated-whitney-v1"
 
 
 @dataclass(frozen=True)
@@ -15,11 +19,15 @@ class AnalysisPlan:
     samples: tuple
     convention: str
     fingerprint: str
+    target_mesh: object = None
 
     def binding(self):
-        return {"revision_id": self.revision_id, "source_digest": self.source_digest,
+        result = {"revision_id": self.revision_id, "source_digest": self.source_digest,
                 "samples": [dict(item) for item in self.samples],
                 "convention": self.convention}
+        if self.convention == RETRIANGULATION_CONVENTION:
+            result["target_mesh"] = self.target_mesh.to_record()
+        return result
 
 
 class PlanService:
@@ -41,6 +49,23 @@ class PlanService:
         normalized = [validate_sample(revision.mesh, item) for item in samples]
         binding = {"revision_id": revision_id, "source_digest": revision.fingerprint,
                    "samples": normalized, "convention": CONVENTION}
+        return self._bind_plan(request_id, revision_id, binding)
+
+    def create_retriangulation_plan(self, request_id, revision_id, target_mesh, samples):
+        if type(request_id) is not str or not request_id:
+            raise ValueError("nonempty plan request ID required")
+        revision = self.revisions.read(revision_id)
+        target = normalize_mesh(target_mesh)
+        if type(samples) not in (list, tuple):
+            raise ValueError("ordered sample sequence required")
+        normalized = [validate_sample(target, item) for item in samples]
+        build_transfer_evidence(revision.mesh, target)
+        binding = {"revision_id": revision_id, "source_digest": revision.fingerprint,
+                   "samples": normalized, "convention": RETRIANGULATION_CONVENTION,
+                   "target_mesh": target.to_record()}
+        return self._bind_plan(request_id, revision_id, binding)
+
+    def _bind_plan(self, request_id, revision_id, binding):
         raw = encode_payload(binding)
         with self.store.transaction():
             row = self.store.connection.execute(
@@ -66,16 +91,28 @@ class PlanService:
             raise KeyError(plan_id)
         try:
             binding = decode_payload(row[3])
-            if (type(binding) is not dict or set(binding) != {
-                    "revision_id", "source_digest", "samples", "convention"}
+            if (type(binding) is not dict
                     or canonical_digest(binding) != row[2]
-                    or binding["revision_id"] != row[1]
-                    or type(binding["revision_id"]) is not int
-                    or binding["convention"] != CONVENTION
-                    or type(binding["source_digest"]) is not str
-                    or type(binding["samples"]) is not list):
+                    or binding.get("revision_id") != row[1]
+                    or type(binding.get("revision_id")) is not int
+                    or type(binding.get("source_digest")) is not str
+                    or type(binding.get("samples")) is not list):
                 raise ValueError("damaged or unsupported plan binding")
-            return AnalysisPlan(plan_id, row[0], row[1], binding["source_digest"],
-                                tuple(binding["samples"]), CONVENTION, row[2])
+            convention = binding.get("convention")
+            if convention == CONVENTION:
+                if set(binding) != {"revision_id", "source_digest", "samples", "convention"}:
+                    raise ValueError("damaged or unsupported plan binding")
+                return AnalysisPlan(plan_id, row[0], row[1], binding["source_digest"],
+                                    tuple(binding["samples"]), CONVENTION, row[2])
+            if convention == RETRIANGULATION_CONVENTION:
+                if set(binding) != {"revision_id", "source_digest", "samples",
+                                    "convention", "target_mesh"}:
+                    raise ValueError("damaged or unsupported plan binding")
+                target = OrdinaryMesh.from_record(binding["target_mesh"])
+                samples = tuple(validate_sample(target, item)
+                                for item in binding["samples"])
+                return AnalysisPlan(plan_id, row[0], row[1], binding["source_digest"],
+                                    samples, RETRIANGULATION_CONVENTION, row[2], target)
+            raise ValueError("damaged or unsupported plan binding")
         except (KeyError, TypeError) as exc:
             raise ValueError("damaged analysis plan") from exc

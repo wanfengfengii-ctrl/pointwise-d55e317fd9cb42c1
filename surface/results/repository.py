@@ -5,7 +5,7 @@ from surface.results.codec import encode_payload, decode_payload, canonical_dige
 from surface.mesh.model import OrdinaryMesh
 from surface.sources.field_input import normalize_fields
 from surface.mesh.barycentric import validate_sample
-from surface.tasks.plans import CONVENTION
+from surface.tasks.plans import CONVENTION, RETRIANGULATION_CONVENTION
 
 
 def _fractions(mapping, identities):
@@ -14,37 +14,12 @@ def _fractions(mapping, identities):
         raise ValueError("invalid complete rational mapping")
 
 
-def _validate(record):
-    names = {"kind", "binding", "input", "requests", "samples", "circulations",
-             "face_totals", "balance"}
-    if type(record) is not dict or set(record) != names:
-        raise ValueError("invalid result structure")
-    if record["kind"] != "ordinary-analysis-v1":
-        raise ValueError("unsupported result kind")
-    binding, source = record["binding"], record["input"]
-    if (type(binding) is not dict or set(binding) != {
-            "plan_id", "plan_digest", "revision_id", "source_digest", "convention"}
-            or any(type(binding[k]) is not int or binding[k] < 1
-                   for k in ("plan_id", "revision_id"))
-            or binding["convention"] != CONVENTION
-            or any(type(binding[k]) is not str for k in ("source_digest", "plan_digest"))
-            or type(source) is not dict or set(source) != {"mesh", "fields"}
-            or canonical_digest(source) != binding["source_digest"]):
-        raise ValueError("invalid fixed source binding")
-    mesh = OrdinaryMesh.from_record(source["mesh"])
-    fields = normalize_fields(mesh, source["fields"])
-    requests = record["requests"]
+def _validate_requests_samples(mesh, requests, samples):
     if type(requests) is not list:
         raise ValueError("ordered requests required")
     normalized = [validate_sample(mesh, sample) for sample in requests]
     if requests != normalized:
         raise ValueError("noncanonical sample requests")
-    plan_binding = {"revision_id": binding["revision_id"],
-                    "source_digest": binding["source_digest"],
-                    "samples": requests, "convention": CONVENTION}
-    if canonical_digest(plan_binding) != binding["plan_digest"]:
-        raise ValueError("invalid fixed plan binding")
-    samples = record["samples"]
     if type(samples) is not list or len(samples) != len(requests):
         raise ValueError("incomplete samples")
     for request, sample in zip(requests, samples):
@@ -54,11 +29,9 @@ def _validate(record):
                 or any(not isinstance(x, Fraction) for x in sample["position"])
                 or not isinstance(sample["value"], Fraction)):
             raise ValueError("invalid stored sample")
-    _fractions(record["circulations"], mesh.faces)
-    _fractions(record["face_totals"], mesh.faces)
-    if record["face_totals"] != fields.to_record()["face_totals"]:
-        raise ValueError("stored totals differ from fixed input")
-    balance = record["balance"]
+
+
+def _validate_balance(balance, mesh):
     if type(balance) is not dict or set(balance) != {
             "face_gaps", "boundary_terms", "internal_terms", "boundary_total",
             "internal_total", "circulation_total", "face_total", "gap_total"}:
@@ -80,6 +53,133 @@ def _validate(record):
                     or not isinstance(item["value"], Fraction)):
                 raise ValueError("invalid ledger item")
             seen.add(item["edge"])
+
+
+def _validate_binding(binding, source, convention):
+    if (type(binding) is not dict or set(binding) != {
+            "plan_id", "plan_digest", "revision_id", "source_digest", "convention"}
+            or any(type(binding[k]) is not int or binding[k] < 1
+                   for k in ("plan_id", "revision_id"))
+            or binding["convention"] != convention
+            or any(type(binding[k]) is not str for k in ("source_digest", "plan_digest"))
+            or type(source) is not dict or set(source) != {"mesh", "fields"}
+            or canonical_digest(source) != binding["source_digest"]):
+        raise ValueError("invalid fixed source binding")
+
+
+def _validate_ordinary(record):
+    names = {"kind", "binding", "input", "requests", "samples", "circulations",
+             "face_totals", "balance"}
+    if set(record) != names:
+        raise ValueError("invalid result structure")
+    binding, source = record["binding"], record["input"]
+    _validate_binding(binding, source, CONVENTION)
+    mesh = OrdinaryMesh.from_record(source["mesh"])
+    fields = normalize_fields(mesh, source["fields"])
+    requests = record["requests"]
+    _validate_requests_samples(mesh, requests, record["samples"])
+    plan_binding = {"revision_id": binding["revision_id"],
+                    "source_digest": binding["source_digest"],
+                    "samples": requests, "convention": CONVENTION}
+    if canonical_digest(plan_binding) != binding["plan_digest"]:
+        raise ValueError("invalid fixed plan binding")
+    _fractions(record["circulations"], mesh.faces)
+    _fractions(record["face_totals"], mesh.faces)
+    if record["face_totals"] != fields.to_record()["face_totals"]:
+        raise ValueError("stored totals differ from fixed input")
+    _validate_balance(record["balance"], mesh)
+
+
+def _valid_weights(value):
+    return (type(value) is tuple and len(value) == 3
+            and all(isinstance(w, Fraction) for w in value)
+            and all(w >= 0 for w in value) and sum(value) == 1)
+
+
+def _validate_transfer(transfer, source_mesh, target_mesh):
+    if type(transfer) is not dict or set(transfer) != {"nodes", "edges", "overlaps"}:
+        raise ValueError("incomplete transfer evidence")
+    nodes, edges, overlaps = transfer["nodes"], transfer["edges"], transfer["overlaps"]
+    if type(nodes) is not dict or set(nodes) != set(target_mesh.nodes):
+        raise ValueError("node evidence must cover target nodes")
+    for item in nodes.values():
+        if (type(item) is not dict or set(item) != {"source_face", "weights"}
+                or item["source_face"] not in source_mesh.faces
+                or not _valid_weights(item["weights"])):
+            raise ValueError("invalid node evidence")
+    if type(edges) is not dict or set(edges) != set(target_mesh.edges):
+        raise ValueError("edge evidence must cover target edges")
+    for edge, pieces in edges.items():
+        if type(edge) is not tuple or type(pieces) is not list or not pieces:
+            raise ValueError("invalid edge evidence")
+        for item in pieces:
+            if (type(item) is not dict or set(item) != {
+                    "source_face", "interval", "start_weights", "end_weights"}
+                    or item["source_face"] not in source_mesh.faces):
+                raise ValueError("invalid edge evidence")
+            interval = item["interval"]
+            if (type(interval) is not tuple or len(interval) != 2
+                    or any(not isinstance(t, Fraction) for t in interval)
+                    or interval[0] < 0 or interval[0] >= interval[1]
+                    or interval[1] > 1
+                    or not _valid_weights(item["start_weights"])
+                    or not _valid_weights(item["end_weights"])):
+                raise ValueError("invalid edge evidence")
+    if type(overlaps) is not list:
+        raise ValueError("invalid overlap evidence")
+    for item in overlaps:
+        if (type(item) is not dict or set(item) != {
+                "source_face", "target_face", "source_weights", "source_fraction"}
+                or item["source_face"] not in source_mesh.faces
+                or item["target_face"] not in target_mesh.faces
+                or type(item["source_weights"]) is not tuple
+                or len(item["source_weights"]) < 3
+                or any(not _valid_weights(w) for w in item["source_weights"])
+                or not isinstance(item["source_fraction"], Fraction)
+                or item["source_fraction"] <= 0):
+            raise ValueError("invalid overlap evidence")
+
+
+def _validate_retriangulated(record):
+    names = {"kind", "binding", "input", "requests", "samples", "circulations",
+             "face_totals", "balance", "target", "transfer"}
+    if set(record) != names:
+        raise ValueError("invalid result structure")
+    binding, source = record["binding"], record["input"]
+    _validate_binding(binding, source, RETRIANGULATION_CONVENTION)
+    source_mesh = OrdinaryMesh.from_record(source["mesh"])
+    normalize_fields(source_mesh, source["fields"])
+    target = record["target"]
+    if type(target) is not dict or set(target) != {"mesh", "fields"}:
+        raise ValueError("invalid target record")
+    target_mesh = OrdinaryMesh.from_record(target["mesh"])
+    target_fields = normalize_fields(target_mesh, target["fields"])
+    requests = record["requests"]
+    _validate_requests_samples(target_mesh, requests, record["samples"])
+    plan_binding = {"revision_id": binding["revision_id"],
+                    "source_digest": binding["source_digest"],
+                    "samples": requests, "convention": RETRIANGULATION_CONVENTION,
+                    "target_mesh": target["mesh"]}
+    if canonical_digest(plan_binding) != binding["plan_digest"]:
+        raise ValueError("invalid fixed plan binding")
+    _fractions(record["circulations"], target_mesh.faces)
+    _fractions(record["face_totals"], target_mesh.faces)
+    if record["face_totals"] != target_fields.to_record()["face_totals"]:
+        raise ValueError("stored totals differ from fixed input")
+    _validate_balance(record["balance"], target_mesh)
+    _validate_transfer(record["transfer"], source_mesh, target_mesh)
+
+
+def _validate(record):
+    if type(record) is not dict:
+        raise ValueError("invalid result structure")
+    kind = record.get("kind")
+    if kind == "ordinary-analysis-v1":
+        _validate_ordinary(record)
+    elif kind == "retriangulated-analysis-v1":
+        _validate_retriangulated(record)
+    else:
+        raise ValueError("unsupported result kind")
 
 
 @dataclass(frozen=True)
