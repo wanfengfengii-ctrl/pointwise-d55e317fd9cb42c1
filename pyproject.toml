@@ -1,0 +1,9 @@
+[project]
+name = "coastal-surface-archive"
+version = "1.0.0"
+description = "Exact ordinary triangular surface field quality archive"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.surface]
+execution = "Run directly from the repository root with Python 3.11; no installation required."
